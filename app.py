@@ -400,7 +400,7 @@ def final_scores(psi_a, psi_b, psi_c):
 # -------------------- Streamlit App --------------------
 st.set_page_config(page_title="TS-to-Energy MCDM", layout="wide")
 st.title("Integrated MCDM for Tannery Sludge-to-Energy Technology Selection")
-st.mark("Based on Moktadir et al. (2024), Chemical Engineering Journal")
+st.markdown("Based on Moktadir et al. (2024), Chemical Engineering Journal")
 
 # Sidebar navigation
 module = st.sidebar.radio("Select Module", 
