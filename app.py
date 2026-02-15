@@ -491,11 +491,11 @@ elif module == "1. Fuzzy Delphi":
         st.dataframe(results_df)
         st.success(f"{sum(selected)} criteria selected (GMI ≥ {threshold})")
 
-# ---------- Module 2: Fuzzy BWM ----------
+# ---------- Module 2: Fuzzy BWM (Revised) ----------
 elif module == "2. Fuzzy BWM":
     st.header("Fuzzy BWM – Factor Weighting")
-    st.markdown("Determine the best and worst factors, then provide fuzzy comparisons.")
-    
+    st.markdown("Each expert selects their own best and worst factors, then provides fuzzy comparisons.")
+
     # Linguistic scale for BWM (Table S6)
     bwm_ling_map = {
         "Very Low (VL)": (1, 1, 3),
@@ -504,7 +504,7 @@ elif module == "2. Fuzzy BWM":
         "High (H)": (5, 7, 9),
         "Very High (VH)": (7, 9, 9)
     }
-    
+
     # Input: factors
     if st.checkbox("Use sample factors (main factors from paper)"):
         factors = ["Technical (T)", "Economic (E)", "Environmental (En)", "Social (S)", "Governance (G)"]
@@ -512,58 +512,238 @@ elif module == "2. Fuzzy BWM":
     else:
         n_factors = st.number_input("Number of factors", min_value=2, value=3, step=1)
         factors = [st.text_input(f"Factor {i+1} name", value=f"F{i+1}") for i in range(n_factors)]
-    
+
     n_exp = st.number_input("Number of experts", min_value=1, value=3, step=1)
-    
-    # Assume all experts agree on best and worst for simplicity
-    best_idx = st.selectbox("Best factor", options=range(n_factors), format_func=lambda x: factors[x])
-    worst_idx = st.selectbox("Worst factor", options=range(n_factors), format_func=lambda x: factors[x])
-    
-    # Collect best-to-others and others-to-worst for each expert
-    if st.button("Proceed to input comparisons"):
+
+    # Initialize session state for expert data if not exists
+    if 'bwm_expert_data' not in st.session_state:
+        st.session_state['bwm_expert_data'] = [None] * n_exp
+
+    # Step 1: Collect per-expert best, worst, and comparisons
+    if st.button("Start Expert Data Entry"):
         st.session_state['bwm_factors'] = factors
-        st.session_state['bwm_best'] = best_idx
-        st.session_state['bwm_worst'] = worst_idx
         st.session_state['bwm_n_exp'] = n_exp
-    
-    if 'bwm_factors' in st.session_state:
+        st.session_state['bwm_current_expert'] = 0
+        st.session_state['bwm_expert_data'] = [None] * n_exp
+        st.session_state['bwm_data_entry_done'] = False
+
+    if 'bwm_factors' in st.session_state and not st.session_state.get('bwm_data_entry_done', False):
         factors = st.session_state['bwm_factors']
-        best_idx = st.session_state['bwm_best']
-        worst_idx = st.session_state['bwm_worst']
         n_exp = st.session_state['bwm_n_exp']
-        
-        st.subheader("Best-to-Others Comparisons")
-        best_to_others = []
-        for e in range(n_exp):
-            st.write(f"**Expert {e+1}**")
-            row = []
+        current = st.session_state['bwm_current_expert']
+
+        if current < n_exp:
+            st.subheader(f"Expert {current+1} Data")
+            # Select best and worst for this expert
+            best_idx_exp = st.selectbox(f"Best factor for Expert {current+1}", 
+                                         options=range(len(factors)), 
+                                         format_func=lambda x: factors[x],
+                                         key=f"exp{current}_best")
+            worst_idx_exp = st.selectbox(f"Worst factor for Expert {current+1}", 
+                                          options=range(len(factors)), 
+                                          format_func=lambda x: factors[x],
+                                          key=f"exp{current}_worst")
+
+            # Best-to-others comparisons
+            st.write("Best-to-others comparisons (using the best factor selected above):")
+            bto = []
             for j in range(len(factors)):
-                if j == best_idx:
-                    row.append((1,1,1))
+                if j == best_idx_exp:
+                    bto.append((1,1,1))
                 else:
                     ling = st.selectbox(f"Best to {factors[j]}", 
                                         options=list(bwm_ling_map.keys()),
-                                        key=f"bto_e{e}_f{j}")
-                    row.append(bwm_ling_map[ling])
-            best_to_others.append(row)
-        
-        st.subheader("Others-to-Worst Comparisons")
-        others_to_worst = []
-        for e in range(n_exp):
-            st.write(f"**Expert {e+1}**")
-            row = []
+                                        key=f"exp{current}_bto_{j}")
+                    bto.append(bwm_ling_map[ling])
+
+            # Others-to-worst comparisons
+            st.write("Others-to-worst comparisons (using the worst factor selected above):")
+            otw = []
             for j in range(len(factors)):
-                if j == worst_idx:
-                    row.append((1,1,1))
+                if j == worst_idx_exp:
+                    otw.append((1,1,1))
                 else:
                     ling = st.selectbox(f"{factors[j]} to worst", 
                                         options=list(bwm_ling_map.keys()),
-                                        key=f"otw_e{e}_f{j}")
-                    row.append(bwm_ling_map[ling])
-            others_to_worst.append(row)
-        
+                                        key=f"exp{current}_otw_{j}")
+                    otw.append(bwm_ling_map[ling])
+
+            if st.button(f"Save Expert {current+1} Data"):
+                st.session_state['bwm_expert_data'][current] = {
+                    'best': best_idx_exp,
+                    'worst': worst_idx_exp,
+                    'bto': bto,
+                    'otw': otw
+                }
+                st.session_state['bwm_current_expert'] += 1
+                st.rerun()
+        else:
+            st.success("All experts' data entered.")
+            st.session_state['bwm_data_entry_done'] = True
+
+    # After all data entered, determine highly recognized best and worst
+    if st.session_state.get('bwm_data_entry_done', False):
+        expert_data = st.session_state['bwm_expert_data']
+        factors = st.session_state['bwm_factors']
+
+        # Count frequency of best and worst selections
+        best_counts = {}
+        worst_counts = {}
+        for ed in expert_data:
+            best_counts[ed['best']] = best_counts.get(ed['best'], 0) + 1
+            worst_counts[ed['worst']] = worst_counts.get(ed['worst'], 0) + 1
+
+        # Most frequent best and worst
+        common_best = max(best_counts, key=best_counts.get)
+        common_worst = max(worst_counts, key=worst_counts.get)
+
+        st.info(f"Highly recognized best factor: {factors[common_best]} (chosen by {best_counts[common_best]} experts)")
+        st.info(f"Highly recognized worst factor: {factors[common_worst]} (chosen by {worst_counts[common_worst]} experts)")
+
+        # Transform each expert's vectors to common best/worst
+        transformed_bto = []  # list of experts, each list of TFN for best-to-common-best
+        transformed_otw = []  # list of experts, each list of TFN for common-worst-to-worst
+
+        for ed in expert_data:
+            # Best-to-others transformation
+            # Original best is ed['best'], common best is common_best
+            # New comparison for factor j = original_best_to_j / original_best_to_common_best
+            orig_bto = ed['bto']
+            divisor = orig_bto[common_best]  # comparison of original best to common best
+            new_bto = []
+            for j in range(len(factors)):
+                if j == common_best:
+                    new_bto.append((1,1,1))
+                else:
+                    # fuzzy division: (l1/u2, m1/m2, u1/l2)
+                    l = orig_bto[j][0] / divisor[2]
+                    m = orig_bto[j][1] / divisor[1]
+                    u = orig_bto[j][2] / divisor[0]
+                    new_bto.append((l, m, u))
+            transformed_bto.append(new_bto)
+
+            # Others-to-worst transformation
+            # Original worst is ed['worst'], common worst is common_worst
+            # New comparison for factor j = original_j_to_worst / original_common_worst_to_worst
+            orig_otw = ed['otw']
+            divisor = orig_otw[common_worst]  # comparison of common worst to original worst? Wait: orig_otw[j] is j to original worst.
+            # We need: new_j_to_common_worst = orig_j_to_original_worst / orig_common_worst_to_original_worst
+            # So divisor = orig_otw[common_worst]
+            new_otw = []
+            for j in range(len(factors)):
+                if j == common_worst:
+                    new_otw.append((1,1,1))
+                else:
+                    l = orig_otw[j][0] / divisor[2]
+                    m = orig_otw[j][1] / divisor[1]
+                    u = orig_otw[j][2] / divisor[0]
+                    new_otw.append((l, m, u))
+            transformed_otw.append(new_otw)
+
+        # Aggregate across experts using geometric mean
+        agg_best = []
+        agg_worst = []
+        for j in range(len(factors)):
+            tfns_b = [t[j] for t in transformed_bto]
+            agg_best.append(geometric_mean(tfns_b))
+            tfns_w = [t[j] for t in transformed_otw]
+            agg_worst.append(geometric_mean(tfns_w))
+
+        # Now solve optimization with agg_best as best-to-other (with common best) and agg_worst as other-to-worst (with common worst)
+        best_idx = common_best
+        worst_idx = common_worst
+
         if st.button("Compute Fuzzy BWM Weights"):
-            weights, xi = run_bwm(factors, best_idx, worst_idx, best_to_others, others_to_worst)
+            # Build optimization as before, but using agg_best and agg_worst
+            n = len(factors)
+            # (same optimization code as before, using agg_best and agg_worst)
+            # ... (copy the run_bwm function's optimization part, but we need to pass agg_best and agg_worst)
+            # For brevity, we'll reuse the run_bwm function but we need to adapt it to accept aggregated vectors directly.
+            # We'll create a new function that takes agg_best, agg_worst, best_idx, worst_idx.
+            # Since the optimization part is long, we'll define it inline here.
+
+            def solve_bwm_aggregated(agg_best, agg_worst, best_idx, worst_idx):
+                n = len(agg_best)
+                x0 = []
+                for i in range(n):
+                    x0.extend([1/n, 1/n, 1/n])
+                x0.append(0.5)
+                cons = []
+                # Best-to-others constraints
+                for j in range(n):
+                    if j == best_idx:
+                        continue
+                    l_Bj, m_Bj, u_Bj = agg_best[j]
+                    cons.append({'type': 'ineq', 'fun': lambda x, j=j, lbj=l_Bj: x[best_idx*3] - lbj * x[j*3] + x[-1]})
+                    cons.append({'type': 'ineq', 'fun': lambda x, j=j, lbj=l_Bj: -x[best_idx*3] + lbj * x[j*3] + x[-1]})
+                    cons.append({'type': 'ineq', 'fun': lambda x, j=j, mbj=m_Bj: x[best_idx*3+1] - mbj * x[j*3+1] + x[-1]})
+                    cons.append({'type': 'ineq', 'fun': lambda x, j=j, mbj=m_Bj: -x[best_idx*3+1] + mbj * x[j*3+1] + x[-1]})
+                    cons.append({'type': 'ineq', 'fun': lambda x, j=j, ubj=u_Bj: x[best_idx*3+2] - ubj * x[j*3+2] + x[-1]})
+                    cons.append({'type': 'ineq', 'fun': lambda x, j=j, ubj=u_Bj: -x[best_idx*3+2] + ubj * x[j*3+2] + x[-1]})
+                # Others-to-worst constraints
+                for j in range(n):
+                    if j == worst_idx:
+                        continue
+                    l_jW, m_jW, u_jW = agg_worst[j]
+                    cons.append({'type': 'ineq', 'fun': lambda x, j=j, ljw=l_jW: x[j*3] - ljw * x[worst_idx*3] + x[-1]})
+                    cons.append({'type': 'ineq', 'fun': lambda x, j=j, ljw=l_jW: -x[j*3] + ljw * x[worst_idx*3] + x[-1]})
+                    cons.append({'type': 'ineq', 'fun': lambda x, j=j, mjw=m_jW: x[j*3+1] - mjw * x[worst_idx*3+1] + x[-1]})
+                    cons.append({'type': 'ineq', 'fun': lambda x, j=j, mjw=m_jW: -x[j*3+1] + mjw * x[worst_idx*3+1] + x[-1]})
+                    cons.append({'type': 'ineq', 'fun': lambda x, j=j, ujw=u_jW: x[j*3+2] - ujw * x[worst_idx*3+2] + x[-1]})
+                    cons.append({'type': 'ineq', 'fun': lambda x, j=j, ujw=u_jW: -x[j*3+2] + ujw * x[worst_idx*3+2] + x[-1]})
+                # Sum GMI = 1
+                def gmi_sum(x):
+                    s = 0
+                    for i in range(n):
+                        s += (x[i*3] + 4*x[i*3+1] + x[i*3+2]) / 6
+                    return s - 1
+                cons.append({'type': 'eq', 'fun': gmi_sum})
+                # Sum m_j = 1
+                def m_sum(x):
+                    return sum(x[i*3+1] for i in range(n)) - 1
+                cons.append({'type': 'eq', 'fun': m_sum})
+                # l_j + sum_{i≠j} u_i >= 1
+                for j in range(n):
+                    def l_plus_u(x, j=j):
+                        s = x[j*3]
+                        for i in range(n):
+                            if i != j:
+                                s += x[i*3+2]
+                        return s - 1
+                    cons.append({'type': 'ineq', 'fun': l_plus_u})
+                # u_j + sum_{i≠j} l_i <= 1
+                for j in range(n):
+                    def u_plus_l(x, j=j):
+                        s = x[j*3+2]
+                        for i in range(n):
+                            if i != j:
+                                s += x[i*3]
+                        return 1 - s
+                    cons.append({'type': 'ineq', 'fun': u_plus_l})
+                # l_j <= m_j <= u_j
+                for j in range(n):
+                    cons.append({'type': 'ineq', 'fun': lambda x, j=j: x[j*3+1] - x[j*3]})
+                    cons.append({'type': 'ineq', 'fun': lambda x, j=j: x[j*3+2] - x[j*3+1]})
+                # xi >= 0
+                cons.append({'type': 'ineq', 'fun': lambda x: x[-1]})
+                # Objective
+                def objective(x):
+                    return x[-1]
+                bounds = [(0, None)] * (3*n + 1)
+                result = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=cons, options={'maxiter': 1000})
+                if not result.success:
+                    st.warning("Optimization failed: " + result.message)
+                weights = []
+                for i in range(n):
+                    l = result.x[i*3]
+                    m = result.x[i*3+1]
+                    u = result.x[i*3+2]
+                    weights.append((l, m, u))
+                xi = result.x[-1]
+                return weights, xi
+
+            weights, xi = solve_bwm_aggregated(agg_best, agg_worst, best_idx, worst_idx)
+
             st.subheader("Fuzzy Weights")
             for i, w in enumerate(weights):
                 st.write(f"{factors[i]}: ({w[0]:.4f}, {w[1]:.4f}, {w[2]:.4f})  GMI = {gmi(w):.4f}")
