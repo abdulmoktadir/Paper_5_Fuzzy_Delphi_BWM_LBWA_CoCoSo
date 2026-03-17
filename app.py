@@ -2,7 +2,7 @@ import math
 import numpy as np
 import pandas as pd
 import streamlit as st
-from scipy.optimize import minimize
+from scipy.optimize import linprog
 
 # ============================================================
 # PAGE CONFIG
@@ -139,6 +139,7 @@ def safe_normalize_to_1(v: np.ndarray) -> np.ndarray:
     return v / s
 
 def tfn_div(a, b):
+    # fuzzy division for positive TFNs
     # (l1/u2, m1/m2, u1/l2)
     return (
         a[0] / max(b[2], EPS),
@@ -180,9 +181,7 @@ def make_bar_df(items, scores, item_col="Item", score_col="Value"):
 
 def to_bc_label(x: str) -> str:
     s = str(x).strip().upper()
-    if s in {"B", "BENEFIT", "MAX"}:
-        return "B"
-    return "C"
+    return "B" if s in {"B", "BENEFIT", "MAX"} else "C"
 
 # ============================================================
 # FUZZY DELPHI
@@ -198,28 +197,19 @@ def run_delphi(criteria_tfns, threshold):
     return selected, agg_tfns, gmi_vals
 
 # ============================================================
-# FUZZY BWM TRANSFORMATION + AGGREGATION
+# FUZZY BWM: TRANSFORMATION + AGGREGATION
 # ============================================================
-def choose_common_factor(idxs, factors):
+def choose_common_factor(idxs):
     counts = {}
     for idx in idxs:
         counts[idx] = counts.get(idx, 0) + 1
     max_count = max(counts.values())
     winners = [k for k, v in counts.items() if v == max_count]
-    chosen = min(winners)
-    return chosen, counts
+    return min(winners), counts
 
 def transform_bwm_expert(expert, common_best_idx, common_worst_idx, n):
     """
     Transform one expert's initial opinions to common best/common worst.
-
-    Initial:
-      expert["bto"] = original best-to-others vector
-      expert["otw"] = original others-to-worst vector
-
-    Transformation:
-      transformed_bto[j] = a_Bj / a_B(common_best)
-      transformed_otw[j] = a_jW / a_(common_worst)W
     """
     orig_bto = expert["bto"]
     orig_otw = expert["otw"]
@@ -252,117 +242,240 @@ def aggregate_bwm_vectors(transformed_experts, n):
         agg_worst.append(geometric_mean([ex["otw_trans"][j] for ex in transformed_experts]))
     return agg_best, agg_worst
 
-def build_vector_table(expert_list, factors, key_name, expert_labels):
+def build_vector_table(expert_list, factors, key_name, expert_labels, digits=3):
     rows = []
     for e_label, ex in zip(expert_labels, expert_list):
         row = {"Expert": e_label}
         for j, f in enumerate(factors):
-            row[f] = tfn_to_str(ex[key_name][j])
+            row[f] = tfn_to_str(ex[key_name][j], digits)
         rows.append(row)
     return pd.DataFrame(rows)
 
-def build_aggregate_table(factors, agg_best, agg_worst):
+def build_aggregate_table(factors, agg_best, agg_worst, digits=3):
     return pd.DataFrame({
         "Factor": factors,
-        "Combined f_B→other": [tfn_to_str(x) for x in agg_best],
-        "Combined other→f_W": [tfn_to_str(x) for x in agg_worst],
-        "Defuzzified f_B→other": [round(gmi(x), 6) for x in agg_best],
-        "Defuzzified other→f_W": [round(gmi(x), 6) for x in agg_worst],
+        "Aggregated Converted f_B→other": [tfn_to_str(x, digits) for x in agg_best],
+        "Aggregated Converted other→f_W": [tfn_to_str(x, digits) for x in agg_worst],
     })
 
 # ============================================================
-# FUZZY BWM OPTIMIZATION
+# FUZZY BWM: DIRECT LP SOLVER
 # ============================================================
-def solve_bwm_aggregated(agg_best, agg_worst, best_idx, worst_idx):
-    n = len(agg_best)
-    x0 = []
-    for _ in range(n):
-        x0.extend([1 / n, 1 / n, 1 / n])
-    x0.append(0.5)  # xi
+def solve_bwm_aggregated_lp(agg_best, agg_worst, best_idx, worst_idx):
+    """
+    Direct LP model from aggregated converted vectors.
 
-    cons = []
+    Uses:
+      l_B - u_Bj*l_j <= ξ and >= -ξ
+      m_B - m_Bj*m_j <= ξ and >= -ξ
+      u_B - l_Bj*u_j <= ξ and >= -ξ
+
+      l_j - u_jW*l_W <= ξ and >= -ξ
+      m_j - m_jW*m_W <= ξ and >= -ξ
+      u_j - l_jW*u_W <= ξ and >= -ξ
+
+    plus:
+      Σ GMI(w_j) = 1
+      Σ m_j = 1
+      u_j + Σ_{i≠j} l_i <= 1
+      l_j + Σ_{i≠j} u_i >= 1
+      l_j <= m_j <= u_j
+      l_j >= 0, ξ in [0,1]
+    """
+    n = len(agg_best)
+    nvar = 3 * n + 1
+    xi_idx = 3 * n
+
+    def idx_l(i): return 3 * i
+    def idx_m(i): return 3 * i + 1
+    def idx_u(i): return 3 * i + 2
+
+    A_ub, b_ub = [], []
+    A_eq, b_eq = [], []
 
     # Best-to-others
     for j in range(n):
         if j == best_idx:
             continue
-        l_Bj, m_Bj, u_Bj = agg_best[j]
-        cons.append({'type': 'ineq', 'fun': lambda x, j=j, lbj=l_Bj: x[best_idx*3]   - lbj * x[j*3]   + x[-1]})
-        cons.append({'type': 'ineq', 'fun': lambda x, j=j, lbj=l_Bj: -x[best_idx*3]  + lbj * x[j*3]   + x[-1]})
-        cons.append({'type': 'ineq', 'fun': lambda x, j=j, mbj=m_Bj: x[best_idx*3+1] - mbj * x[j*3+1] + x[-1]})
-        cons.append({'type': 'ineq', 'fun': lambda x, j=j, mbj=m_Bj: -x[best_idx*3+1]+ mbj * x[j*3+1] + x[-1]})
-        cons.append({'type': 'ineq', 'fun': lambda x, j=j, ubj=u_Bj: x[best_idx*3+2] - ubj * x[j*3+2] + x[-1]})
-        cons.append({'type': 'ineq', 'fun': lambda x, j=j, ubj=u_Bj: -x[best_idx*3+2]+ ubj * x[j*3+2] + x[-1]})
+
+        lBj, mBj, uBj = agg_best[j]
+
+        # l_B - uBj*l_j <= xi
+        row = np.zeros(nvar)
+        row[idx_l(best_idx)] = 1
+        row[idx_l(j)] = -uBj
+        row[xi_idx] = -1
+        A_ub.append(row)
+        b_ub.append(0)
+
+        # -(l_B - uBj*l_j) <= xi
+        row = np.zeros(nvar)
+        row[idx_l(best_idx)] = -1
+        row[idx_l(j)] = uBj
+        row[xi_idx] = -1
+        A_ub.append(row)
+        b_ub.append(0)
+
+        # m_B - mBj*m_j <= xi
+        row = np.zeros(nvar)
+        row[idx_m(best_idx)] = 1
+        row[idx_m(j)] = -mBj
+        row[xi_idx] = -1
+        A_ub.append(row)
+        b_ub.append(0)
+
+        # -(m_B - mBj*m_j) <= xi
+        row = np.zeros(nvar)
+        row[idx_m(best_idx)] = -1
+        row[idx_m(j)] = mBj
+        row[xi_idx] = -1
+        A_ub.append(row)
+        b_ub.append(0)
+
+        # u_B - lBj*u_j <= xi
+        row = np.zeros(nvar)
+        row[idx_u(best_idx)] = 1
+        row[idx_u(j)] = -lBj
+        row[xi_idx] = -1
+        A_ub.append(row)
+        b_ub.append(0)
+
+        # -(u_B - lBj*u_j) <= xi
+        row = np.zeros(nvar)
+        row[idx_u(best_idx)] = -1
+        row[idx_u(j)] = lBj
+        row[xi_idx] = -1
+        A_ub.append(row)
+        b_ub.append(0)
 
     # Others-to-worst
     for j in range(n):
         if j == worst_idx:
             continue
-        l_jW, m_jW, u_jW = agg_worst[j]
-        cons.append({'type': 'ineq', 'fun': lambda x, j=j, ljw=l_jW: x[j*3]   - ljw * x[worst_idx*3]   + x[-1]})
-        cons.append({'type': 'ineq', 'fun': lambda x, j=j, ljw=l_jW: -x[j*3]  + ljw * x[worst_idx*3]   + x[-1]})
-        cons.append({'type': 'ineq', 'fun': lambda x, j=j, mjw=m_jW: x[j*3+1] - mjw * x[worst_idx*3+1] + x[-1]})
-        cons.append({'type': 'ineq', 'fun': lambda x, j=j, mjw=m_jW: -x[j*3+1]+ mjw * x[worst_idx*3+1] + x[-1]})
-        cons.append({'type': 'ineq', 'fun': lambda x, j=j, ujw=u_jW: x[j*3+2] - ujw * x[worst_idx*3+2] + x[-1]})
-        cons.append({'type': 'ineq', 'fun': lambda x, j=j, ujw=u_jW: -x[j*3+2]+ ujw * x[worst_idx*3+2] + x[-1]})
 
-    # Σ GMI(wj)=1
-    def gmi_sum(x):
-        return sum((x[i*3] + 4*x[i*3+1] + x[i*3+2]) / 6 for i in range(n)) - 1
-    cons.append({'type': 'eq', 'fun': gmi_sum})
+        ljW, mjW, ujW = agg_worst[j]
 
-    # Σ mj = 1
-    def m_sum(x):
-        return sum(x[i*3+1] for i in range(n)) - 1
-    cons.append({'type': 'eq', 'fun': m_sum})
+        # l_j - ujW*l_W <= xi
+        row = np.zeros(nvar)
+        row[idx_l(j)] = 1
+        row[idx_l(worst_idx)] = -ujW
+        row[xi_idx] = -1
+        A_ub.append(row)
+        b_ub.append(0)
 
-    # l_j + Σ_{i≠j}u_i >= 1
+        # -(l_j - ujW*l_W) <= xi
+        row = np.zeros(nvar)
+        row[idx_l(j)] = -1
+        row[idx_l(worst_idx)] = ujW
+        row[xi_idx] = -1
+        A_ub.append(row)
+        b_ub.append(0)
+
+        # m_j - mjW*m_W <= xi
+        row = np.zeros(nvar)
+        row[idx_m(j)] = 1
+        row[idx_m(worst_idx)] = -mjW
+        row[xi_idx] = -1
+        A_ub.append(row)
+        b_ub.append(0)
+
+        # -(m_j - mjW*m_W) <= xi
+        row = np.zeros(nvar)
+        row[idx_m(j)] = -1
+        row[idx_m(worst_idx)] = mjW
+        row[xi_idx] = -1
+        A_ub.append(row)
+        b_ub.append(0)
+
+        # u_j - ljW*u_W <= xi
+        row = np.zeros(nvar)
+        row[idx_u(j)] = 1
+        row[idx_u(worst_idx)] = -ljW
+        row[xi_idx] = -1
+        A_ub.append(row)
+        b_ub.append(0)
+
+        # -(u_j - ljW*u_W) <= xi
+        row = np.zeros(nvar)
+        row[idx_u(j)] = -1
+        row[idx_u(worst_idx)] = ljW
+        row[xi_idx] = -1
+        A_ub.append(row)
+        b_ub.append(0)
+
+    # Σ GMI = 1
+    row = np.zeros(nvar)
+    for i in range(n):
+        row[idx_l(i)] = 1 / 6
+        row[idx_m(i)] = 4 / 6
+        row[idx_u(i)] = 1 / 6
+    A_eq.append(row)
+    b_eq.append(1.0)
+
+    # Σ m = 1
+    row = np.zeros(nvar)
+    for i in range(n):
+        row[idx_m(i)] = 1
+    A_eq.append(row)
+    b_eq.append(1.0)
+
+    # u_j + sum_{i≠j} l_i <= 1
     for j in range(n):
-        def l_plus_u(x, j=j):
-            s = x[j*3]
-            for i in range(n):
-                if i != j:
-                    s += x[i*3+2]
-            return s - 1
-        cons.append({'type': 'ineq', 'fun': l_plus_u})
+        row = np.zeros(nvar)
+        row[idx_u(j)] = 1
+        for i in range(n):
+            if i != j:
+                row[idx_l(i)] = 1
+        A_ub.append(row)
+        b_ub.append(1.0)
 
-    # u_j + Σ_{i≠j}l_i <= 1
+    # l_j + sum_{i≠j} u_i >= 1  -->  -(...) <= -1
     for j in range(n):
-        def u_plus_l(x, j=j):
-            s = x[j*3+2]
-            for i in range(n):
-                if i != j:
-                    s += x[i*3]
-            return 1 - s
-        cons.append({'type': 'ineq', 'fun': u_plus_l})
+        row = np.zeros(nvar)
+        row[idx_l(j)] = -1
+        for i in range(n):
+            if i != j:
+                row[idx_u(i)] = -1
+        A_ub.append(row)
+        b_ub.append(-1.0)
 
-    # lj <= mj <= uj
-    for j in range(n):
-        cons.append({'type': 'ineq', 'fun': lambda x, j=j: x[j*3+1] - x[j*3]})
-        cons.append({'type': 'ineq', 'fun': lambda x, j=j: x[j*3+2] - x[j*3+1]})
+    # l <= m <= u
+    for i in range(n):
+        row = np.zeros(nvar)
+        row[idx_l(i)] = 1
+        row[idx_m(i)] = -1
+        A_ub.append(row)
+        b_ub.append(0)
 
-    cons.append({'type': 'ineq', 'fun': lambda x: x[-1]})  # xi >= 0
+        row = np.zeros(nvar)
+        row[idx_m(i)] = 1
+        row[idx_u(i)] = -1
+        A_ub.append(row)
+        b_ub.append(0)
 
-    def objective(x):
-        return x[-1]
+    # objective: min xi
+    c = np.zeros(nvar)
+    c[xi_idx] = 1.0
 
-    bounds = [(0, None)] * (3 * n + 1)
-    result = minimize(
-        objective,
-        x0,
-        method="SLSQP",
+    # bounds
+    bounds = [(0, None)] * (3 * n) + [(0, 1)]
+
+    res = linprog(
+        c=c,
+        A_ub=np.array(A_ub, dtype=float),
+        b_ub=np.array(b_ub, dtype=float),
+        A_eq=np.array(A_eq, dtype=float),
+        b_eq=np.array(b_eq, dtype=float),
         bounds=bounds,
-        constraints=cons,
-        options={"maxiter": 1000},
+        method="highs",
     )
 
-    if not result.success:
-        st.warning("Optimization warning: " + result.message)
+    if not res.success:
+        raise RuntimeError("Linear optimization failed: " + res.message)
 
-    weights = []
-    for i in range(n):
-        weights.append((result.x[i*3], result.x[i*3+1], result.x[i*3+2]))
-    xi = result.x[-1]
+    x = res.x
+    weights = [(x[idx_l(i)], x[idx_m(i)], x[idx_u(i)]) for i in range(n)]
+    xi = x[xi_idx]
     return weights, xi
 
 # ============================================================
@@ -382,10 +495,7 @@ def run_lbwa(factors, best_idx, level_data, lambda_data):
     lambda_tfns = []
     for j in range(n):
         vals = [lambda_data[e][j] for e in range(n_exp)]
-        l = min(vals)
-        m = float(np.mean(vals))
-        u = max(vals)
-        lambda_tfns.append((l, m, u))
+        lambda_tfns.append((min(vals), float(np.mean(vals)), max(vals)))
 
     levels = level_data[0]
 
@@ -401,7 +511,7 @@ def run_lbwa(factors, best_idx, level_data, lambda_data):
         inf_u = p / (lvl * p + lam[0] + EPS)
         influence.append((inf_l, inf_m, inf_u))
 
-    sum_inf_l, sum_inf_m, sum_inf_u = 1.0, 1.0, 1.0
+    sum_inf_l = sum_inf_m = sum_inf_u = 1.0
     for j in range(n):
         if j == best_idx:
             continue
@@ -430,6 +540,7 @@ def run_lbwa(factors, best_idx, level_data, lambda_data):
 # ============================================================
 def combine_weights(fbwm_weights, lbwa_weights, alpha_tfn, beta_tfn):
     n = len(fbwm_weights)
+
     alpha_l, alpha_m, alpha_u = alpha_tfn
     beta_l, beta_m, beta_u = beta_tfn
 
@@ -445,16 +556,17 @@ def combine_weights(fbwm_weights, lbwa_weights, alpha_tfn, beta_tfn):
 
     composite = []
     for i in range(n):
-        w_l = num_l[i] / max(denom_u, EPS)
-        w_m = num_m[i] / max(denom_m, EPS)
-        w_u = num_u[i] / max(denom_l, EPS)
-        composite.append((w_l, w_m, w_u))
+        composite.append((
+            num_l[i] / max(denom_u, EPS),
+            num_m[i] / max(denom_m, EPS),
+            num_u[i] / max(denom_l, EPS),
+        ))
     return composite
 
 # ============================================================
 # BONFERRONI COCO-SO HELPERS
 # ============================================================
-def fuzzy_df_to_nested_matrix(fuzzy_df: pd.DataFrame, criteria, alternatives):
+def fuzzy_df_to_nested_matrix(fuzzy_df, criteria, alternatives):
     matrix = []
     for alt in alternatives:
         row = []
@@ -469,52 +581,41 @@ def fuzzy_df_to_nested_matrix(fuzzy_df: pd.DataFrame, criteria, alternatives):
     return matrix
 
 def normalize_cocoso_bonferroni(decision, types_bc):
-    n_alt = len(decision)
-    n_crit = len(types_bc)
+    n_alt, n_crit = len(decision), len(types_bc)
     norm = [[(0.0, 0.0, 0.0) for _ in range(n_crit)] for _ in range(n_alt)]
 
     for j in range(n_crit):
         typ = to_bc_label(types_bc[j])
 
         if typ == "B":
-            max_u = max(decision[i][j][2] for i in range(n_alt))
-            max_u = safe_pos(max_u)
+            max_u = safe_pos(max(decision[i][j][2] for i in range(n_alt)))
             for i in range(n_alt):
                 l, m, u = decision[i][j]
                 norm[i][j] = (l / max_u, m / max_u, u / max_u)
         else:
-            min_l = min(decision[i][j][0] for i in range(n_alt))
-            min_l = safe_pos(min_l)
+            min_l = safe_pos(min(decision[i][j][0] for i in range(n_alt)))
             for i in range(n_alt):
                 l, m, u = decision[i][j]
-                l = safe_pos(l)
-                m = safe_pos(m)
-                u = safe_pos(u)
-                norm[i][j] = (min_l / u, min_l / m, min_l / l)
-
+                norm[i][j] = (
+                    min_l / safe_pos(u),
+                    min_l / safe_pos(m),
+                    min_l / safe_pos(l),
+                )
     return norm
 
 def compute_bonferroni_excel_style(norm_matrix, weights, phi1=1.0, phi2=1.0):
     weights = safe_normalize_to_1(pd.Series(weights).astype(float).values)
 
-    n_alt = len(norm_matrix)
-    n_crit = len(weights)
-
+    n_alt, n_crit = len(norm_matrix), len(weights)
     if n_crit < 2:
         raise ValueError("At least two criteria are required for fuzzy Bonferroni CoCoSo.")
 
-    scob = []
-    pcob = []
+    scob, pcob = [], []
     exp_term = 1.0 / safe_pos(phi1 + phi2)
 
     for a in range(n_alt):
-        s_l = 0.0
-        s_m = 0.0
-        s_u = 0.0
-
-        log_p_l = 0.0
-        log_p_m = 0.0
-        log_p_u = 0.0
+        s_l = s_m = s_u = 0.0
+        log_p_l = log_p_m = log_p_u = 0.0
 
         for i in range(n_crit):
             wi = min(max(weights[i], EPS), 1.0 - EPS)
@@ -524,8 +625,7 @@ def compute_bonferroni_excel_style(norm_matrix, weights, phi1=1.0, phi2=1.0):
                 if i == j:
                     continue
 
-                wj = weights[j]
-                term = (wi * wj) / denom
+                term = (wi * weights[j]) / denom
 
                 gi_l, gi_m, gi_u = norm_matrix[a][i]
                 gj_l, gj_m, gj_u = norm_matrix[a][j]
@@ -534,23 +634,20 @@ def compute_bonferroni_excel_style(norm_matrix, weights, phi1=1.0, phi2=1.0):
                 s_m += term * (safe_pos(gi_m) ** phi1) * (safe_pos(gj_m) ** phi2)
                 s_u += term * (safe_pos(gi_u) ** phi1) * (safe_pos(gj_u) ** phi2)
 
-                base_l = safe_pos(phi1 * gi_l + phi2 * gj_l)
-                base_m = safe_pos(phi1 * gi_m + phi2 * gj_m)
-                base_u = safe_pos(phi1 * gi_u + phi2 * gj_u)
+                log_p_l += term * math.log(safe_pos(phi1 * gi_l + phi2 * gj_l))
+                log_p_m += term * math.log(safe_pos(phi1 * gi_m + phi2 * gj_m))
+                log_p_u += term * math.log(safe_pos(phi1 * gi_u + phi2 * gj_u))
 
-                log_p_l += term * math.log(base_l)
-                log_p_m += term * math.log(base_m)
-                log_p_u += term * math.log(base_u)
-
-        s_l = safe_pos(s_l) ** exp_term
-        s_m = safe_pos(s_m) ** exp_term
-        s_u = safe_pos(s_u) ** exp_term
-        scob.append((s_l, s_m, s_u))
-
-        p_l = math.exp(log_p_l) / safe_pos(phi1 + phi2)
-        p_m = math.exp(log_p_m) / safe_pos(phi1 + phi2)
-        p_u = math.exp(log_p_u) / safe_pos(phi1 + phi2)
-        pcob.append((p_l, p_m, p_u))
+        scob.append((
+            safe_pos(s_l) ** exp_term,
+            safe_pos(s_m) ** exp_term,
+            safe_pos(s_u) ** exp_term,
+        ))
+        pcob.append((
+            math.exp(log_p_l) / safe_pos(phi1 + phi2),
+            math.exp(log_p_m) / safe_pos(phi1 + phi2),
+            math.exp(log_p_u) / safe_pos(phi1 + phi2),
+        ))
 
     return scob, pcob
 
@@ -568,6 +665,7 @@ def relative_significance_excel_style(scob, pcob, pi=0.5):
     min_scob_l = min(s[0] for s in scob)
     min_scob_m = min(s[1] for s in scob)
     min_scob_u = min(s[2] for s in scob)
+
     max_scob_l = max(s[0] for s in scob)
     max_scob_m = max(s[1] for s in scob)
     max_scob_u = max(s[2] for s in scob)
@@ -575,6 +673,7 @@ def relative_significance_excel_style(scob, pcob, pi=0.5):
     min_pcob_l = min(p[0] for p in pcob)
     min_pcob_m = min(p[1] for p in pcob)
     min_pcob_u = min(p[2] for p in pcob)
+
     max_pcob_l = max(p[0] for p in pcob)
     max_pcob_m = max(p[1] for p in pcob)
     max_pcob_u = max(p[2] for p in pcob)
@@ -585,20 +684,23 @@ def relative_significance_excel_style(scob, pcob, pi=0.5):
         s = scob[i]
         p = pcob[i]
 
-        a_l = (s[0] + p[0]) / safe_pos(sum_scob_u + sum_pcob_u)
-        a_m = (s[1] + p[1]) / safe_pos(sum_scob_m + sum_pcob_m)
-        a_u = (s[2] + p[2]) / safe_pos(sum_scob_l + sum_pcob_l)
-        psi_a.append((a_l, a_m, a_u))
+        psi_a.append((
+            (s[0] + p[0]) / safe_pos(sum_scob_u + sum_pcob_u),
+            (s[1] + p[1]) / safe_pos(sum_scob_m + sum_pcob_m),
+            (s[2] + p[2]) / safe_pos(sum_scob_l + sum_pcob_l),
+        ))
 
-        b_l = (s[0] / safe_pos(min_scob_u)) + (p[0] / safe_pos(min_pcob_u))
-        b_m = (s[1] / safe_pos(min_scob_m)) + (p[1] / safe_pos(min_pcob_m))
-        b_u = (s[2] / safe_pos(min_scob_l)) + (p[2] / safe_pos(min_pcob_l))
-        psi_b.append((b_l, b_m, b_u))
+        psi_b.append((
+            s[0] / safe_pos(min_scob_u) + p[0] / safe_pos(min_pcob_u),
+            s[1] / safe_pos(min_scob_m) + p[1] / safe_pos(min_pcob_m),
+            s[2] / safe_pos(min_scob_l) + p[2] / safe_pos(min_pcob_l),
+        ))
 
-        c_l = (pi * s[0] + (1 - pi) * p[0]) / safe_pos(pi * max_scob_u + (1 - pi) * max_pcob_u)
-        c_m = (pi * s[1] + (1 - pi) * p[1]) / safe_pos(pi * max_scob_m + (1 - pi) * max_pcob_m)
-        c_u = (pi * s[2] + (1 - pi) * p[2]) / safe_pos(pi * max_scob_l + (1 - pi) * max_pcob_l)
-        psi_c.append((c_l, c_m, c_u))
+        psi_c.append((
+            (pi * s[0] + (1 - pi) * p[0]) / safe_pos(pi * max_scob_u + (1 - pi) * max_pcob_u),
+            (pi * s[1] + (1 - pi) * p[1]) / safe_pos(pi * max_scob_m + (1 - pi) * max_pcob_m),
+            (pi * s[2] + (1 - pi) * p[2]) / safe_pos(pi * max_scob_l + (1 - pi) * max_pcob_l),
+        ))
 
     return psi_a, psi_b, psi_c
 
@@ -609,9 +711,7 @@ def final_scores_bonferroni(psi_a, psi_b, psi_c, alternative_names=None):
 
     rows = []
     for i in range(n_alt):
-        a = psi_a[i]
-        b = psi_b[i]
-        c = psi_c[i]
+        a, b, c = psi_a[i], psi_b[i], psi_c[i]
 
         prod_l = (safe_pos(a[0]) * safe_pos(b[0]) * safe_pos(c[0])) ** (1 / 3)
         prod_m = (safe_pos(a[1]) * safe_pos(b[1]) * safe_pos(c[1])) ** (1 / 3)
@@ -622,15 +722,14 @@ def final_scores_bonferroni(psi_a, psi_b, psi_c, alternative_names=None):
         avg_u = (a[2] + b[2] + c[2]) / 3.0
 
         final_tfn = (prod_l + avg_l, prod_m + avg_m, prod_u + avg_u)
-        crisp = defuzz_tfn(final_tfn)
 
         rows.append([
             alternative_names[i],
-            a[0], a[1], a[2],
-            b[0], b[1], b[2],
-            c[0], c[1], c[2],
-            final_tfn[0], final_tfn[1], final_tfn[2],
-            crisp,
+            *a,
+            *b,
+            *c,
+            *final_tfn,
+            defuzz_tfn(final_tfn),
         ])
 
     df = pd.DataFrame(
@@ -653,34 +752,58 @@ def cocoso_bonferroni_from_app(fuzzy_df, types_bc, crisp_weights, phi1=1.0, phi2
 
     decision = fuzzy_df_to_nested_matrix(fuzzy_df, criteria, alternatives)
     norm_matrix = normalize_cocoso_bonferroni(decision, types_bc)
-    weights = pd.Series(crisp_weights, index=criteria).astype(float)
-
-    scob, pcob = compute_bonferroni_excel_style(norm_matrix, weights, phi1=phi1, phi2=phi2)
-    psi_a, psi_b, psi_c = relative_significance_excel_style(scob, pcob, pi=pi)
-    ranking_df = final_scores_bonferroni(psi_a, psi_b, psi_c, alternative_names=alternatives)
+    scob, pcob = compute_bonferroni_excel_style(norm_matrix, crisp_weights, phi1, phi2)
+    psi_a, psi_b, psi_c = relative_significance_excel_style(scob, pcob, pi)
+    ranking_df = final_scores_bonferroni(psi_a, psi_b, psi_c, alternatives)
 
     norm_rows = []
     for i, alt in enumerate(alternatives):
         row = {"Alternative": alt}
         for j, c in enumerate(criteria):
-            row[f"{c}_l"] = norm_matrix[i][j][0]
-            row[f"{c}_m"] = norm_matrix[i][j][1]
-            row[f"{c}_u"] = norm_matrix[i][j][2]
+            row[f"{c}_l"], row[f"{c}_m"], row[f"{c}_u"] = norm_matrix[i][j]
         norm_rows.append(row)
-    norm_df = pd.DataFrame(norm_rows).set_index("Alternative")
 
+    norm_df = pd.DataFrame(norm_rows).set_index("Alternative")
     scob_df = pd.DataFrame(scob, columns=["SCoB_l", "SCoB_m", "SCoB_u"], index=alternatives)
     pcob_df = pd.DataFrame(pcob, columns=["PCoB_l", "PCoB_m", "PCoB_u"], index=alternatives)
     psi_a_df = pd.DataFrame(psi_a, columns=["psi_a_l", "psi_a_m", "psi_a_u"], index=alternatives)
     psi_b_df = pd.DataFrame(psi_b, columns=["psi_b_l", "psi_b_m", "psi_b_u"], index=alternatives)
     psi_c_df = pd.DataFrame(psi_c, columns=["psi_c_l", "psi_c_m", "psi_c_u"], index=alternatives)
 
-    meta = {"phi1": phi1, "phi2": phi2, "pi": pi}
-    return ranking_df, meta, norm_df, scob_df, pcob_df, psi_a_df, psi_b_df, psi_c_df
+    return ranking_df, {"phi1": phi1, "phi2": phi2, "pi": pi}, norm_df, scob_df, pcob_df, psi_a_df, psi_b_df, psi_c_df
 
 # ============================================================
 # SAMPLE INITIALIZERS
 # ============================================================
+def get_bwm_paper_sample(factors):
+    target = ["T", "E", "En", "S", "G"]
+    if factors != target:
+        return None, None
+
+    summary = pd.DataFrame(
+        [["E", "En"], ["E", "S"], ["T", "S"], ["E", "S"], ["G", "S"]],
+        columns=["Best", "Worst"],
+        index=[f"E{i+1}" for i in range(5)],
+    )
+
+    tables = []
+    data = [
+        {"B→j": ["L", "EQ", "VH", "H", "M"],  "j→W": ["M", "VH", "EQ", "VL", "L"]},
+        {"B→j": ["VL", "EQ", "H", "VH", "L"], "j→W": ["H", "VH", "L", "EQ", "M"]},
+        {"B→j": ["EQ", "VL", "M", "VH", "L"], "j→W": ["VH", "H", "VL", "EQ", "VL"]},
+        {"B→j": ["VL", "EQ", "H", "VH", "L"], "j→W": ["H", "VH", "VL", "EQ", "M"]},
+        {"B→j": ["L", "VL", "M", "VH", "EQ"], "j→W": ["M", "H", "VL", "EQ", "VH"]},
+    ]
+
+    for d in data:
+        tables.append(pd.DataFrame({
+            "Factor": factors,
+            "B→j": d["B→j"],
+            "j→W": d["j→W"],
+        }))
+
+    return summary, tables
+
 def init_delphi_table(criteria_names, n_exp, use_sample=False):
     rng = np.random.default_rng(42)
     expert_cols = [f"E{i+1}" for i in range(n_exp)]
@@ -690,28 +813,35 @@ def init_delphi_table(criteria_names, n_exp, use_sample=False):
     return pd.DataFrame("MR", index=criteria_names, columns=expert_cols)
 
 def init_bwm_summary(factors, n_exp, use_sample=False):
+    if use_sample and n_exp == 5:
+        s, _ = get_bwm_paper_sample(factors)
+        if s is not None:
+            return s
+
     rng = np.random.default_rng(123)
     rows = []
     for _ in range(n_exp):
         if use_sample:
             best_idx = int(rng.integers(0, len(factors)))
-            worst_idx = int(rng.integers(0, len(factors)-1))
+            worst_idx = int(rng.integers(0, len(factors) - 1))
             if worst_idx >= best_idx:
                 worst_idx += 1
             rows.append([factors[best_idx], factors[worst_idx]])
         else:
             rows.append([factors[0], factors[-1]])
+
     return pd.DataFrame(rows, columns=["Best", "Worst"], index=[f"E{i+1}" for i in range(n_exp)])
 
-def init_bwm_pairwise_df(factors, best_factor, worst_factor, use_sample=False, seed=0):
+def init_bwm_pairwise_df(factors, best_factor, worst_factor, use_sample=False, seed=0, expert_idx=None):
+    if use_sample and expert_idx is not None:
+        _, tables = get_bwm_paper_sample(factors)
+        if tables is not None and expert_idx < len(tables):
+            return tables[expert_idx].copy()
+
     rng = np.random.default_rng(seed)
     codes = ["VL", "L", "M", "H", "VH"]
-    if use_sample:
-        b_codes = rng.choice(codes, size=len(factors))
-        w_codes = rng.choice(codes, size=len(factors))
-    else:
-        b_codes = np.array(["M"] * len(factors))
-        w_codes = np.array(["M"] * len(factors))
+    b_codes = rng.choice(codes, size=len(factors)) if use_sample else np.array(["M"] * len(factors))
+    w_codes = rng.choice(codes, size=len(factors)) if use_sample else np.array(["M"] * len(factors))
 
     df = pd.DataFrame({
         "Factor": factors,
@@ -730,11 +860,7 @@ def init_lbwa_df(factors, use_sample=False, seed=0):
     else:
         levels = np.ones(len(factors), dtype=int)
         lambdas = np.zeros(len(factors))
-    return pd.DataFrame({
-        "Factor": factors,
-        "Level": levels,
-        "λ": lambdas
-    })
+    return pd.DataFrame({"Factor": factors, "Level": levels, "λ": lambdas})
 
 def init_criteria_weight_df(criteria_names, weights=None):
     if weights is None:
@@ -766,29 +892,19 @@ def init_decision_df(criteria_names, use_sample=False, seed=0):
 st.sidebar.title("📘 Model Navigator")
 module = st.sidebar.radio(
     "Choose model",
-    [
-        "🏠 Home",
-        "1) Fuzzy Delphi",
-        "2) Fuzzy BWM",
-        "3) Fuzzy LBWA + Hybrid",
-        "4) Fuzzy Bonferroni CoCoSo",
-    ],
+    ["🏠 Home", "1) Fuzzy Delphi", "2) Fuzzy BWM", "3) Fuzzy LBWA + Hybrid", "4) Fuzzy Bonferroni CoCoSo"]
 )
-
 st.sidebar.markdown("---")
 st.sidebar.markdown(
-    """
-    **Workflow**
-    
-    1. Fuzzy Delphi  
-    2. Fuzzy BWM  
-    3. Fuzzy LBWA + Hybrid  
-    4. Fuzzy Bonferroni CoCoSo  
-    """
+    "**Workflow**\n\n"
+    "1. Fuzzy Delphi  \n"
+    "2. Fuzzy BWM  \n"
+    "3. Fuzzy LBWA + Hybrid  \n"
+    "4. Fuzzy Bonferroni CoCoSo"
 )
 
 st.title("Integrated Fuzzy MCDM Platform")
-st.caption("Cleaner interface with corrected Fuzzy BWM transformation before aggregation")
+st.caption("BWM now uses transformed aggregated converted vectors directly in a linear optimization model")
 
 # ============================================================
 # HOME
@@ -798,11 +914,12 @@ if module == "🏠 Home":
     st.markdown(
         """
         <div class="app-card">
-            <div class="card-title">What is corrected in this version</div>
+            <div class="card-title">What is fixed in this version</div>
             <div class="small-note">
-            The Fuzzy BWM module now explicitly performs:
-            initial expert input → common best/worst identification → transformation →
-            fuzzy geometric aggregation → optimization.
+            The Fuzzy BWM block now follows:
+            initial expert vectors → common best/worst → transformation →
+            aggregated converted vectors → direct optimization from TFNs.
+            No defuzzification is used before solving the BWM model.
             </div>
         </div>
         """,
@@ -839,29 +956,22 @@ elif module == "1) Fuzzy Delphi":
         st.session_state["delphi_sig"] = delphi_sig
         st.session_state["delphi_df"] = init_delphi_table(criteria_names, n_exp, use_sample_delphi)
 
-    delphi_df = st.session_state["delphi_df"]
-
     edited_delphi = st.data_editor(
-        delphi_df,
+        st.session_state["delphi_df"],
         key="delphi_editor",
         use_container_width=True,
         num_rows="fixed",
         column_config={
-            col: st.column_config.SelectboxColumn(
-                col,
-                options=list(DELHI_SCALE.keys()),
-                required=True,
-            )
-            for col in delphi_df.columns
-        }
+            col: st.column_config.SelectboxColumn(col, options=list(DELHI_SCALE.keys()), required=True)
+            for col in st.session_state["delphi_df"].columns
+        },
     )
 
     if st.button("Run Fuzzy Delphi", type="primary"):
-        criteria_tfns = []
-        for crit in edited_delphi.index:
-            tfns = [DELHI_SCALE[str(edited_delphi.loc[crit, col])] for col in edited_delphi.columns]
-            criteria_tfns.append(tfns)
-
+        criteria_tfns = [
+            [DELHI_SCALE[str(edited_delphi.loc[crit, col])] for col in edited_delphi.columns]
+            for crit in edited_delphi.index
+        ]
         selected, agg_tfns, gmi_vals = run_delphi(criteria_tfns, threshold)
 
         results_df = pd.DataFrame({
@@ -870,7 +980,6 @@ elif module == "1) Fuzzy Delphi":
             "GMI": [round(x, 4) for x in gmi_vals],
             "Selected": ["Yes" if x else "No" for x in selected],
         })
-
         st.dataframe(results_df, use_container_width=True, hide_index=True)
         st.bar_chart(make_bar_df(criteria_names, gmi_vals, "Criterion", "GMI"))
 
@@ -878,17 +987,16 @@ elif module == "1) Fuzzy Delphi":
 # MODULE 2: FUZZY BWM
 # ============================================================
 elif module == "2) Fuzzy BWM":
-    st.markdown('<div class="section-head">Fuzzy BWM – Corrected Transformation and Aggregation</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-head">Fuzzy BWM – Transformation, Aggregation, and Direct LP Solution</div>', unsafe_allow_html=True)
 
     c1, c2 = st.columns([1, 1.4])
     with c1:
-        use_sample_bwm = st.toggle("Use sample factors", value=True)
+        use_sample_bwm = st.toggle("Load paper demo sample", value=True)
         n_exp_bwm = st.number_input("Number of experts", min_value=1, value=5, step=1)
     with c2:
-        default_factors = ["T", "E", "En", "S", "G"]
         factor_text = st.text_area(
             "Factor names (one per line)",
-            value="\n".join(default_factors if use_sample_bwm else ["F1", "F2", "F3"]),
+            value="\n".join(["T", "E", "En", "S", "G"] if use_sample_bwm else ["F1", "F2", "F3"]),
             height=130,
         )
 
@@ -907,10 +1015,10 @@ elif module == "2) Fuzzy BWM":
             best_factor = st.session_state["bwm_summary_df"].iloc[e]["Best"]
             worst_factor = st.session_state["bwm_summary_df"].iloc[e]["Worst"]
             st.session_state[f"bwm_pair_df_{e}"] = init_bwm_pairwise_df(
-                factors, best_factor, worst_factor, use_sample_bwm, seed=100 + e
+                factors, best_factor, worst_factor, use_sample_bwm, seed=100 + e, expert_idx=e
             )
 
-    st.markdown("**Step A: Initial expert best and worst selection**")
+    st.markdown("**Step A: Expert best and worst selections**")
     bw_summary = st.data_editor(
         st.session_state["bwm_summary_df"],
         key="bwm_summary_editor",
@@ -919,7 +1027,7 @@ elif module == "2) Fuzzy BWM":
         column_config={
             "Best": st.column_config.SelectboxColumn("Best", options=factors, required=True),
             "Worst": st.column_config.SelectboxColumn("Worst", options=factors, required=True),
-        }
+        },
     )
 
     st.markdown("**Step B: Initial expert fuzzy vectors**")
@@ -931,16 +1039,12 @@ elif module == "2) Fuzzy BWM":
             best_factor = bw_summary.iloc[e]["Best"]
             worst_factor = bw_summary.iloc[e]["Worst"]
 
-            if best_factor == worst_factor:
-                st.error(f"Expert {e+1}: best and worst cannot be the same.")
-                base_df = st.session_state[f"bwm_pair_df_{e}"].copy()
-            else:
-                base_df = st.session_state[f"bwm_pair_df_{e}"].copy()
-                if list(base_df["Factor"]) != factors:
-                    base_df = init_bwm_pairwise_df(factors, best_factor, worst_factor, False, seed=100 + e)
+            base_df = st.session_state[f"bwm_pair_df_{e}"].copy()
+            if list(base_df["Factor"]) != factors:
+                base_df = init_bwm_pairwise_df(factors, best_factor, worst_factor, False, seed=100 + e, expert_idx=None)
 
-                base_df.loc[base_df["Factor"] == best_factor, "B→j"] = "EQ"
-                base_df.loc[base_df["Factor"] == worst_factor, "j→W"] = "EQ"
+            base_df.loc[base_df["Factor"] == best_factor, "B→j"] = "EQ"
+            base_df.loc[base_df["Factor"] == worst_factor, "j→W"] = "EQ"
 
             pair_df = st.data_editor(
                 base_df,
@@ -952,34 +1056,30 @@ elif module == "2) Fuzzy BWM":
                     "Factor": st.column_config.TextColumn("Factor", disabled=True),
                     "B→j": st.column_config.SelectboxColumn("B→j", options=list(BWM_SCALE.keys()), required=True),
                     "j→W": st.column_config.SelectboxColumn("j→W", options=list(BWM_SCALE.keys()), required=True),
-                }
+                },
             )
-
             pair_df.loc[pair_df["Factor"] == best_factor, "B→j"] = "EQ"
             pair_df.loc[pair_df["Factor"] == worst_factor, "j→W"] = "EQ"
             edited_pairwise_tables.append(pair_df)
 
             st.caption(f"Best = {best_factor} | Worst = {worst_factor}")
 
-    if st.button("Compute Corrected Fuzzy BWM Weights", type="primary"):
+    if st.button("Solve Corrected Fuzzy BWM", type="primary"):
         for e in range(n_exp_bwm):
             if bw_summary.iloc[e]["Best"] == bw_summary.iloc[e]["Worst"]:
-                st.error("At least one expert has the same best and worst factor.")
+                st.error("At least one expert has identical best and worst factor.")
                 st.stop()
 
-        expert_data = []
         expert_labels = [f"Ex{i+1}" for i in range(n_exp_bwm)]
+        expert_data = []
 
         for e in range(n_exp_bwm):
             best_idx = factors.index(bw_summary.iloc[e]["Best"])
             worst_idx = factors.index(bw_summary.iloc[e]["Worst"])
             table = edited_pairwise_tables[e]
 
-            bto = []
-            otw = []
-            for _, row in table.iterrows():
-                bto.append(BWM_SCALE[str(row["B→j"])])
-                otw.append(BWM_SCALE[str(row["j→W"])])
+            bto = [BWM_SCALE[str(row["B→j"])] for _, row in table.iterrows()]
+            otw = [BWM_SCALE[str(row["j→W"])] for _, row in table.iterrows()]
 
             expert_data.append({
                 "best_idx": best_idx,
@@ -988,25 +1088,17 @@ elif module == "2) Fuzzy BWM":
                 "otw_init": otw,
             })
 
-        common_best_idx, best_counts = choose_common_factor(
-            [ex["best_idx"] for ex in expert_data], factors
-        )
-        common_worst_idx, worst_counts = choose_common_factor(
-            [ex["worst_idx"] for ex in expert_data], factors
-        )
+        common_best_idx, best_counts = choose_common_factor([ex["best_idx"] for ex in expert_data])
+        common_worst_idx, worst_counts = choose_common_factor([ex["worst_idx"] for ex in expert_data])
 
         transformed_experts = []
         for ex in expert_data:
             bto_trans, otw_trans = transform_bwm_expert(
-                {
-                    "bto": ex["bto_init"],
-                    "otw": ex["otw_init"],
-                },
+                {"bto": ex["bto_init"], "otw": ex["otw_init"]},
                 common_best_idx,
                 common_worst_idx,
                 len(factors),
             )
-
             transformed_experts.append({
                 "best_idx": ex["best_idx"],
                 "worst_idx": ex["worst_idx"],
@@ -1017,30 +1109,28 @@ elif module == "2) Fuzzy BWM":
             })
 
         agg_best, agg_worst = aggregate_bwm_vectors(transformed_experts, len(factors))
-        weights, xi = solve_bwm_aggregated(agg_best, agg_worst, common_best_idx, common_worst_idx)
 
-        # --- summary boxes
+        try:
+            weights, xi = solve_bwm_aggregated_lp(agg_best, agg_worst, common_best_idx, common_worst_idx)
+        except Exception as e:
+            st.error(str(e))
+            st.stop()
+
         m1, m2, m3 = st.columns(3)
         with m1:
             st.metric("Common Best", factors[common_best_idx])
         with m2:
             st.metric("Common Worst", factors[common_worst_idx])
         with m3:
-            st.metric("ξ", f"{xi:.6f}")
+            st.metric("ξ*", f"{xi:.6f}")
 
         count_df = pd.DataFrame({
             "Factor": factors,
             "Best count": [best_counts.get(i, 0) for i in range(len(factors))],
-            "Worst count": [worst_counts.get(i, 0) for i in range(len(factors))]
+            "Worst count": [worst_counts.get(i, 0) for i in range(len(factors))],
         })
         st.subheader("Selection Frequency")
         st.dataframe(count_df, use_container_width=True, hide_index=True)
-
-        # --- show initial tables
-        init_bto_df = build_vector_table(transformed_experts, factors, "bto_init", expert_labels)
-        init_otw_df = build_vector_table(transformed_experts, factors, "otw_init", expert_labels)
-        trans_bto_df = build_vector_table(transformed_experts, factors, "bto_trans", expert_labels)
-        trans_otw_df = build_vector_table(transformed_experts, factors, "otw_trans", expert_labels)
 
         tab1, tab2, tab3, tab4 = st.tabs([
             "Initial f_B→other",
@@ -1050,20 +1140,19 @@ elif module == "2) Fuzzy BWM":
         ])
 
         with tab1:
-            st.dataframe(init_bto_df, use_container_width=True, hide_index=True)
+            st.dataframe(build_vector_table(transformed_experts, factors, "bto_init", expert_labels), use_container_width=True, hide_index=True)
         with tab2:
-            st.dataframe(init_otw_df, use_container_width=True, hide_index=True)
+            st.dataframe(build_vector_table(transformed_experts, factors, "otw_init", expert_labels), use_container_width=True, hide_index=True)
         with tab3:
-            st.dataframe(trans_bto_df, use_container_width=True, hide_index=True)
+            st.dataframe(build_vector_table(transformed_experts, factors, "bto_trans", expert_labels), use_container_width=True, hide_index=True)
         with tab4:
-            st.dataframe(trans_otw_df, use_container_width=True, hide_index=True)
+            st.dataframe(build_vector_table(transformed_experts, factors, "otw_trans", expert_labels), use_container_width=True, hide_index=True)
 
-        # --- combined vectors
-        st.subheader("Aggregated Converted Vectors (Fuzzy Geometric Mean)")
+        st.subheader("Aggregated Converted Vectors Used in Optimization")
         agg_df = build_aggregate_table(factors, agg_best, agg_worst)
         st.dataframe(agg_df, use_container_width=True, hide_index=True)
+        st.caption("These TFNs are used directly in the optimization model. No defuzzification is applied before solving BWM.")
 
-        # --- final weights
         result_df = pd.DataFrame({
             "Factor": factors,
             "Weight TFN": [tfn_to_str(w, 6) for w in weights],
@@ -1082,7 +1171,7 @@ elif module == "2) Fuzzy BWM":
         st.session_state["bwm_agg_worst"] = agg_worst
 
 # ============================================================
-# MODULE 3: LBWA + HYBRID
+# MODULE 3: FUZZY LBWA + HYBRID
 # ============================================================
 elif module == "3) Fuzzy LBWA + Hybrid":
     st.markdown('<div class="section-head">Fuzzy LBWA and Hybrid Weighting</div>', unsafe_allow_html=True)
@@ -1106,8 +1195,8 @@ elif module == "3) Fuzzy LBWA + Hybrid":
     best_idx_lbwa = st.selectbox(
         "Best factor for LBWA",
         options=range(len(factors)),
-        index=min(best_idx_default, len(factors)-1),
-        format_func=lambda x: factors[x]
+        index=min(best_idx_default, len(factors) - 1),
+        format_func=lambda x: factors[x],
     )
 
     use_sample_lbwa = st.toggle("Use sample LBWA tables", value=False)
@@ -1119,7 +1208,6 @@ elif module == "3) Fuzzy LBWA + Hybrid":
         for e in range(n_exp_lbwa):
             st.session_state[f"lbwa_df_{e}"] = init_lbwa_df(factors, use_sample_lbwa, seed=200 + e)
 
-    st.markdown("**Expert level and λ tables**")
     lbwa_tabs = st.tabs([f"E{i+1}" for i in range(n_exp_lbwa)])
     lbwa_tables = []
 
@@ -1135,7 +1223,7 @@ elif module == "3) Fuzzy LBWA + Hybrid":
                     "Factor": st.column_config.TextColumn("Factor", disabled=True),
                     "Level": st.column_config.NumberColumn("Level", min_value=1, step=1, format="%d"),
                     "λ": st.column_config.NumberColumn("λ", min_value=0.0, step=0.1, format="%.3f"),
-                }
+                },
             )
             lbwa_tables.append(df)
 
@@ -1149,11 +1237,8 @@ elif module == "3) Fuzzy LBWA + Hybrid":
     beta_tfn = HYBRID_SCALE[beta_code]
 
     if st.button("Compute LBWA and Hybrid Weights", type="primary"):
-        level_data = []
-        lambda_data = []
-        for df in lbwa_tables:
-            level_data.append([int(x) for x in df["Level"].tolist()])
-            lambda_data.append([float(x) for x in df["λ"].tolist()])
+        level_data = [[int(x) for x in df["Level"].tolist()] for df in lbwa_tables]
+        lambda_data = [[float(x) for x in df["λ"].tolist()] for df in lbwa_tables]
 
         lbwa_weights = run_lbwa(factors, best_idx_lbwa, level_data, lambda_data)
         lbwa_df = pd.DataFrame({
@@ -1194,11 +1279,11 @@ elif module == "4) Fuzzy Bonferroni CoCoSo":
     st.info("Bonferroni CoCoSo uses crisp criterion weights after GMI defuzzification of fuzzy weights.")
 
     use_sample_alt = st.toggle("Use sample alternatives", value=True)
-    if use_sample_alt:
-        alt_names = ["TS-SS", "TS-HP", "TS-PCC", "TS-MPP"]
-    else:
-        alt_text = st.text_area("Alternative names (one per line)", value="A1\nA2\nA3", height=120)
-        alt_names = [x.strip() for x in alt_text.splitlines() if x.strip()]
+    alt_names = (
+        ["TS-SS", "TS-HP", "TS-PCC", "TS-MPP"]
+        if use_sample_alt
+        else [x.strip() for x in st.text_area("Alternative names (one per line)", value="A1\nA2\nA3", height=120).splitlines() if x.strip()]
+    )
 
     if len(alt_names) == 0:
         st.warning("Please define at least one alternative.")
@@ -1208,7 +1293,7 @@ elif module == "4) Fuzzy Bonferroni CoCoSo":
     if use_existing_weights:
         criteria_names = st.session_state.get(
             "bwm_factors",
-            [f"C{i+1}" for i in range(len(st.session_state["hybrid_weights"]))]
+            [f"C{i+1}" for i in range(len(st.session_state["hybrid_weights"]))],
         )
         init_weights = st.session_state["hybrid_weights"]
     else:
@@ -1231,7 +1316,6 @@ elif module == "4) Fuzzy Bonferroni CoCoSo":
     criteria_df = st.session_state["cocoso_criteria_df"].copy()
     criteria_df["Criterion"] = criteria_names
 
-    st.markdown("**Criteria fuzzy weights and criterion type**")
     if use_existing_weights:
         edited_criteria = st.data_editor(
             criteria_df,
@@ -1245,7 +1329,7 @@ elif module == "4) Fuzzy Bonferroni CoCoSo":
                 "w_m": st.column_config.NumberColumn("w_m", disabled=True, format="%.6f"),
                 "w_u": st.column_config.NumberColumn("w_u", disabled=True, format="%.6f"),
                 "Type": st.column_config.SelectboxColumn("Type", options=["benefit", "cost"], required=True),
-            }
+            },
         )
     else:
         edited_criteria = st.data_editor(
@@ -1260,20 +1344,15 @@ elif module == "4) Fuzzy Bonferroni CoCoSo":
                 "w_m": st.column_config.NumberColumn("w_m", min_value=0.0, step=0.01, format="%.6f"),
                 "w_u": st.column_config.NumberColumn("w_u", min_value=0.0, step=0.01, format="%.6f"),
                 "Type": st.column_config.SelectboxColumn("Type", options=["benefit", "cost"], required=True),
-            }
+            },
         )
-
-    crisp_preview = []
-    for _, row in edited_criteria.iterrows():
-        crisp_preview.append(defuzz_tfn((float(row["w_l"]), float(row["w_m"]), float(row["w_u"]))))
 
     preview_df = pd.DataFrame({
         "Criterion": edited_criteria["Criterion"].tolist(),
-        "Crisp weight (GMI)": crisp_preview
+        "Crisp weight (GMI)": [defuzz_tfn((float(r["w_l"]), float(r["w_m"]), float(r["w_u"]))) for _, r in edited_criteria.iterrows()],
     })
     st.dataframe(preview_df, use_container_width=True, hide_index=True)
 
-    st.markdown("**Decision matrix by alternative**")
     use_sample_dm = st.toggle("Use sample decision matrices", value=False)
     if use_sample_dm:
         for a in range(len(alt_names)):
@@ -1297,7 +1376,7 @@ elif module == "4) Fuzzy Bonferroni CoCoSo":
                     "l": st.column_config.NumberColumn("l", step=0.01, format="%.6f"),
                     "m": st.column_config.NumberColumn("m", step=0.01, format="%.6f"),
                     "u": st.column_config.NumberColumn("u", step=0.01, format="%.6f"),
-                }
+                },
             )
             edited_alt_tables.append(edited_df)
 
@@ -1346,17 +1425,11 @@ elif module == "4) Fuzzy Bonferroni CoCoSo":
         fuzzy_df = fuzzy_df[[col for c in criteria_names for col in [f"{c}_l", f"{c}_m", f"{c}_u"]]]
 
         ranking_df, meta, norm_df, scob_df, pcob_df, psi_a_df, psi_b_df, psi_c_df = cocoso_bonferroni_from_app(
-            fuzzy_df=fuzzy_df,
-            types_bc=types,
-            crisp_weights=crisp_weights,
-            phi1=float(phi1),
-            phi2=float(phi2),
-            pi=float(pi),
+            fuzzy_df, types, crisp_weights, float(phi1), float(phi2), float(pi)
         )
 
         st.subheader("Final Ranking")
-        show_rank_df = ranking_df[["Rank", "Alternative", "Final_l", "Final_m", "Final_u", "Crisp"]].copy()
-        st.dataframe(show_rank_df, use_container_width=True, hide_index=True)
+        st.dataframe(ranking_df[["Rank", "Alternative", "Final_l", "Final_m", "Final_u", "Crisp"]], use_container_width=True, hide_index=True)
         st.bar_chart(ranking_df.set_index("Alternative")[["Crisp"]])
 
         with st.expander("Normalized Bonferroni matrix", expanded=False):
