@@ -148,8 +148,6 @@ def safe_normalize_to_1(v: np.ndarray) -> np.ndarray:
     return v / s
 
 def tfn_div(a, b):
-    # fuzzy division for positive TFNs
-    # (l1/u2, m1/m2, u1/l2)
     return (
         a[0] / max(b[2], EPS),
         a[1] / max(b[1], EPS),
@@ -222,9 +220,6 @@ def choose_common_factor(idxs):
     return min(winners), counts
 
 def transform_bwm_expert(expert, common_best_idx, common_worst_idx, n):
-    """
-    Transform one expert's initial opinions to common best/common worst.
-    """
     orig_bto = expert["bto"]
     orig_otw = expert["otw"]
 
@@ -276,26 +271,6 @@ def build_aggregate_table(factors, agg_best, agg_worst, digits=3):
 # FUZZY BWM: DIRECT LP SOLVER
 # ============================================================
 def solve_bwm_aggregated_lp(agg_best, agg_worst, best_idx, worst_idx):
-    """
-    Direct LP model from aggregated converted vectors.
-
-    Uses:
-      l_B - u_Bj*l_j <= ξ and >= -ξ
-      m_B - m_Bj*m_j <= ξ and >= -ξ
-      u_B - l_Bj*u_j <= ξ and >= -ξ
-
-      l_j - u_jW*l_W <= ξ and >= -ξ
-      m_j - m_jW*m_W <= ξ and >= -ξ
-      u_j - l_jW*u_W <= ξ and >= -ξ
-
-    plus:
-      Σ GMI(w_j) = 1
-      Σ m_j = 1
-      u_j + Σ_{i≠j} l_i <= 1
-      l_j + Σ_{i≠j} u_i >= 1
-      l_j <= m_j <= u_j
-      l_j >= 0, ξ in [0,1]
-    """
     n = len(agg_best)
     nvar = 3 * n + 1
     xi_idx = 3 * n
@@ -307,7 +282,6 @@ def solve_bwm_aggregated_lp(agg_best, agg_worst, best_idx, worst_idx):
     A_ub, b_ub = [], []
     A_eq, b_eq = [], []
 
-    # Best-to-others
     for j in range(n):
         if j == best_idx:
             continue
@@ -356,7 +330,6 @@ def solve_bwm_aggregated_lp(agg_best, agg_worst, best_idx, worst_idx):
         A_ub.append(row)
         b_ub.append(0)
 
-    # Others-to-worst
     for j in range(n):
         if j == worst_idx:
             continue
@@ -405,7 +378,6 @@ def solve_bwm_aggregated_lp(agg_best, agg_worst, best_idx, worst_idx):
         A_ub.append(row)
         b_ub.append(0)
 
-    # Σ GMI = 1
     row = np.zeros(nvar)
     for i in range(n):
         row[idx_l(i)] = 1 / 6
@@ -414,14 +386,12 @@ def solve_bwm_aggregated_lp(agg_best, agg_worst, best_idx, worst_idx):
     A_eq.append(row)
     b_eq.append(1.0)
 
-    # Σ m = 1
     row = np.zeros(nvar)
     for i in range(n):
         row[idx_m(i)] = 1
     A_eq.append(row)
     b_eq.append(1.0)
 
-    # u_j + sum_{i≠j} l_i <= 1
     for j in range(n):
         row = np.zeros(nvar)
         row[idx_u(j)] = 1
@@ -431,7 +401,6 @@ def solve_bwm_aggregated_lp(agg_best, agg_worst, best_idx, worst_idx):
         A_ub.append(row)
         b_ub.append(1.0)
 
-    # l_j + sum_{i≠j} u_i >= 1  -->  -(...) <= -1
     for j in range(n):
         row = np.zeros(nvar)
         row[idx_l(j)] = -1
@@ -441,7 +410,6 @@ def solve_bwm_aggregated_lp(agg_best, agg_worst, best_idx, worst_idx):
         A_ub.append(row)
         b_ub.append(-1.0)
 
-    # l <= m <= u
     for i in range(n):
         row = np.zeros(nvar)
         row[idx_l(i)] = 1
@@ -457,7 +425,6 @@ def solve_bwm_aggregated_lp(agg_best, agg_worst, best_idx, worst_idx):
 
     c = np.zeros(nvar)
     c[xi_idx] = 1.0
-
     bounds = [(0, None)] * (3 * n) + [(0, 1)]
 
     res = linprog(
@@ -482,12 +449,6 @@ def solve_bwm_aggregated_lp(agg_best, agg_worst, best_idx, worst_idx):
 # FUZZY LBWA (EXCEL-ALIGNED)
 # ============================================================
 def run_lbwa_excel_style(factors, reference_idx, expert_tables, theta):
-    """
-    Excel-aligned fuzzy LBWA logic.
-
-    expert_tables: list of DataFrames, each with columns:
-        Factor, Qi, λ
-    """
     n = len(factors)
     n_exp = len(expert_tables)
 
@@ -982,16 +943,15 @@ if module == "🏠 Home":
     st.markdown(
         """
         <div class="app-card">
-            <div class="card-title">What is fixed in this version</div>
+            <div class="card-title">What is new in this version</div>
             <div class="small-note">
             The Fuzzy BWM block now follows:
-            initial expert vectors → common best/worst → transformation →
-            aggregated converted vectors → direct optimization from TFNs.
-            No defuzzification is used before solving the BWM model.
+            Initial expert vectors → Common best/worst → Transformation →
+            Aggregated converted vectors → Direct optimization from TFNs.
             <br><br>
-            The Fuzzy LBWA block is updated to the Excel-aligned logic:
-            λ TFN aggregation → fuzzy influence using θ/(Qi·θ+λ) →
-            reference weight → fuzzy weights → weighted defuzzification → normalization.
+            For the Fuzzy LBWA block:
+            λ TFN aggregation → Fuzzy influence using θ/(Qi·θ+λ) →
+            Reference weight → Fuzzy weights → Weighted defuzzification → Normalization.
             </div>
         </div>
         """,
@@ -1266,6 +1226,7 @@ elif module == "3) Fuzzy LBWA + Hybrid":
     n_exp_lbwa = st.number_input("Number of experts", min_value=1, value=4, step=1)
     theta = st.number_input("Theta (θ)", min_value=0.0001, value=2.1, step=0.1, format="%.4f")
 
+    st.markdown("**Step A: Reference factor selection**")
     reference_idx_lbwa = st.selectbox(
         "Reference / Main factor for LBWA",
         options=range(len(factors)),
@@ -1282,17 +1243,21 @@ elif module == "3) Fuzzy LBWA + Hybrid":
         for e in range(n_exp_lbwa):
             st.session_state[f"lbwa_df_{e}"] = init_lbwa_df(factors, use_sample_lbwa, seed=200 + e)
 
-    st.markdown("**LBWA expert input tables**")
-    lbwa_tabs = st.tabs([f"E{i+1}" for i in range(n_exp_lbwa)])
+    st.markdown("**Step B: Expert LBWA inputs (Qi and λ)**")
+    lbwa_tabs = st.tabs([f"Ex{i+1}" for i in range(n_exp_lbwa)])
     lbwa_tables = []
 
     for e, tab in enumerate(lbwa_tabs):
         with tab:
-            df = st.session_state[f"lbwa_df_{e}"].copy()
-            df["Factor"] = factors
+            base_df = st.session_state[f"lbwa_df_{e}"].copy()
+
+            if list(base_df["Factor"]) != factors:
+                base_df = init_lbwa_df(factors, use_sample=False, seed=200 + e)
+
+            base_df["Factor"] = factors
 
             edited_df = st.data_editor(
-                df,
+                base_df,
                 key=f"lbwa_editor_{e}",
                 use_container_width=True,
                 num_rows="fixed",
@@ -1303,7 +1268,9 @@ elif module == "3) Fuzzy LBWA + Hybrid":
                     "λ": st.column_config.NumberColumn("λ", min_value=0.0, step=0.1, format="%.6f"),
                 },
             )
+
             lbwa_tables.append(edited_df)
+            st.caption(f"Expert = E{e+1} | Reference factor = {factors[reference_idx_lbwa]}")
 
     c1, c2 = st.columns(2)
     with c1:
@@ -1417,7 +1384,7 @@ elif module == "3) Fuzzy LBWA + Hybrid":
             st.error(f"An error occurred while computing LBWA: {e}")
 
 # ============================================================
-# MODULE 4: FUZZY BONFERRONI COCO-SO
+# MODULE 4: FUZZY BONFERRONI COCOSO
 # ============================================================
 elif module == "4) Fuzzy Bonferroni CoCoSo":
     st.markdown('<div class="section-head">Fuzzy Bonferroni CoCoSo – Technology Ranking</div>', unsafe_allow_html=True)
