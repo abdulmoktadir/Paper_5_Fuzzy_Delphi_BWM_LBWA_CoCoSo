@@ -446,62 +446,77 @@ def solve_bwm_aggregated_lp(agg_best, agg_worst, best_idx, worst_idx):
     return weights, xi
 
 # ============================================================
-# FUZZY LBWA (EXCEL-ALIGNED)
+# FUZZY LBWA (SINGLE-TABLE INPUT, EXCEL-ALIGNED)
 # ============================================================
-def run_lbwa_excel_style(factors, reference_idx, expert_tables, theta):
-    n = len(factors)
-    n_exp = len(expert_tables)
+def scalar_divide_tfn(a, tfn_matrix):
+    return np.column_stack([
+        a / np.maximum(tfn_matrix[:, 2], EPS),
+        a / np.maximum(tfn_matrix[:, 1], EPS),
+        a / np.maximum(tfn_matrix[:, 0], EPS),
+    ])
 
-    if n_exp == 0:
-        raise ValueError("At least one expert table is required.")
+def defuzzify_weighted(tfn_matrix):
+    return (tfn_matrix[:, 0] + 4 * tfn_matrix[:, 1] + tfn_matrix[:, 2]) / 6.0
+
+def run_lbwa_excel_single_table(input_df, num_experts, theta, reference_idx):
+    expected_cols = ["Factor", "Qi"] + [f"E{i+1}" for i in range(num_experts)]
+    missing_cols = [c for c in expected_cols if c not in input_df.columns]
+    if missing_cols:
+        raise ValueError(f"Missing required columns: {missing_cols}")
+
+    work_df = input_df.copy()
+    work_df["Factor"] = work_df["Factor"].astype(str).str.strip()
+    work_df["Factor"] = [
+        name if name else f"Factor {i+1}"
+        for i, name in enumerate(work_df["Factor"])
+    ]
+
+    work_df["Qi"] = pd.to_numeric(work_df["Qi"], errors="coerce")
+    expert_cols = [f"E{i+1}" for i in range(num_experts)]
+    for c in expert_cols:
+        work_df[c] = pd.to_numeric(work_df[c], errors="coerce")
+
+    if work_df["Qi"].isna().any():
+        raise ValueError("Qi contains invalid or empty values.")
+    if work_df[expert_cols].isna().any().any():
+        raise ValueError("One or more expert score cells contain invalid or empty values.")
+
+    qi_arr = work_df["Qi"].astype(float).values
+    data = work_df[expert_cols].astype(float).values
+
+    if np.any(qi_arr < 0):
+        raise ValueError("Qi values must be non-negative.")
+    if np.any(data < 0):
+        raise ValueError("Expert scores must be non-negative.")
     if theta <= 0:
         raise ValueError("Theta (θ) must be greater than zero.")
 
-    lam_tfn = []
-    qi_vals = []
+    # TFN = (min, mean, max) across expert columns
+    tfn = np.column_stack([
+        np.min(data, axis=1),
+        np.mean(data, axis=1),
+        np.max(data, axis=1)
+    ])
 
-    for j in range(n):
-        lam_vals = [float(expert_tables[e].iloc[j]["λ"]) for e in range(n_exp)]
-        qi_j = float(expert_tables[0].iloc[j]["Qi"])
-
-        lam_tfn.append((
-            min(lam_vals),
-            float(np.mean(lam_vals)),
-            max(lam_vals),
-        ))
-        qi_vals.append(qi_j)
-
-    qi_arr = np.array(qi_vals, dtype=float)
-
-    input_df = pd.DataFrame({
-        "Factor": factors,
-        "Qi": qi_arr,
-        "λ_l": [x[0] for x in lam_tfn],
-        "λ_m": [x[1] for x in lam_tfn],
-        "λ_u": [x[2] for x in lam_tfn],
-    })
-
-    tfn = np.array(lam_tfn, dtype=float)
     tfn_df = pd.DataFrame(tfn, columns=["l", "m", "u"])
     tfn_df.insert(0, "Qi", qi_arr)
-    tfn_df.insert(0, "Factor", factors)
+    tfn_df.insert(0, "Factor", work_df["Factor"])
 
+    # denominator = (Qi*theta + l, Qi*theta + m, Qi*theta + u)
     denominator_tfn = np.column_stack([
         qi_arr * theta + tfn[:, 0],
         qi_arr * theta + tfn[:, 1],
         qi_arr * theta + tfn[:, 2]
     ])
 
-    influence = np.column_stack([
-        theta / np.maximum(denominator_tfn[:, 2], EPS),
-        theta / np.maximum(denominator_tfn[:, 1], EPS),
-        theta / np.maximum(denominator_tfn[:, 0], EPS),
-    ])
+    # influence = theta / denominator with reversed TFN division
+    influence = scalar_divide_tfn(theta, denominator_tfn)
 
     influence_df = pd.DataFrame(influence, columns=["l", "m", "u"])
     influence_df.insert(0, "Qi", qi_arr)
-    influence_df.insert(0, "Factor", factors)
+    influence_df.insert(0, "Factor", work_df["Factor"])
 
+    n = len(work_df)
     mask_others = np.ones(n, dtype=bool)
     mask_others[reference_idx] = False
 
@@ -519,9 +534,9 @@ def run_lbwa_excel_style(factors, reference_idx, expert_tables, theta):
             fuzzy_weights[i] = ref_weight * influence[i]
 
     fuzzy_weight_df = pd.DataFrame(fuzzy_weights, columns=["l", "m", "u"])
-    fuzzy_weight_df.insert(0, "Factor", factors)
+    fuzzy_weight_df.insert(0, "Factor", work_df["Factor"])
 
-    crisp_values = (fuzzy_weights[:, 0] + 4 * fuzzy_weights[:, 1] + fuzzy_weights[:, 2]) / 6.0
+    crisp_values = defuzzify_weighted(fuzzy_weights)
     crisp_sum = np.sum(crisp_values)
 
     if crisp_sum <= 0:
@@ -530,10 +545,10 @@ def run_lbwa_excel_style(factors, reference_idx, expert_tables, theta):
     normalized_weights = crisp_values / crisp_sum
 
     result_df = pd.DataFrame({
-        "Factor": factors,
+        "Factor": work_df["Factor"],
         "Qi": qi_arr,
         "Crisp Value": crisp_values,
-        "Normalized Weight": normalized_weights,
+        "Normalized Weight": normalized_weights
     })
 
     result_df["Rank"] = result_df["Normalized Weight"].rank(
@@ -549,7 +564,7 @@ def run_lbwa_excel_style(factors, reference_idx, expert_tables, theta):
     top_weight = float(result_df.iloc[0]["Normalized Weight"])
 
     return {
-        "input_df": input_df,
+        "input_df": work_df,
         "tfn_df": tfn_df,
         "influence_df": influence_df,
         "fuzzy_weight_df": fuzzy_weight_df,
@@ -557,6 +572,7 @@ def run_lbwa_excel_style(factors, reference_idx, expert_tables, theta):
         "weights": weights,
         "top_factor": top_factor,
         "top_weight": top_weight,
+        "crisp_sum": float(crisp_sum),
     }
 
 # ============================================================
@@ -876,20 +892,19 @@ def init_bwm_pairwise_df(factors, best_factor, worst_factor, use_sample=False, s
     df.loc[df["Factor"] == worst_factor, "j→W"] = "EQ"
     return df
 
-def init_lbwa_df(factors, use_sample=False, seed=0):
+def init_lbwa_editor_df(factors, n_exp, use_sample=False, seed=0):
     rng = np.random.default_rng(seed)
-    if use_sample:
-        qi_vals = rng.integers(1, 6, size=len(factors))
-        lambdas = np.round(rng.uniform(0.0, 2.0, size=len(factors)), 3)
-    else:
-        qi_vals = np.ones(len(factors), dtype=int)
-        lambdas = np.zeros(len(factors), dtype=float)
-
-    return pd.DataFrame({
+    df = pd.DataFrame({
         "Factor": factors,
-        "Qi": qi_vals,
-        "λ": lambdas
+        "Qi": rng.integers(1, 6, size=len(factors)) if use_sample else np.ones(len(factors), dtype=int),
     })
+
+    for i in range(n_exp):
+        if use_sample:
+            df[f"E{i+1}"] = np.round(rng.uniform(0.0, 2.0, size=len(factors)), 4)
+        else:
+            df[f"E{i+1}"] = np.zeros(len(factors), dtype=float)
+    return df
 
 def init_criteria_weight_df(criteria_names, weights=None):
     if weights is None:
@@ -943,15 +958,15 @@ if module == "🏠 Home":
     st.markdown(
         """
         <div class="app-card">
-            <div class="card-title">What is new in this version</div>
+            <div class="card-title">What is fixed in this version</div>
             <div class="small-note">
-            The Fuzzy BWM block now follows:
-            Initial expert vectors → Common best/worst → Transformation →
-            Aggregated converted vectors → Direct optimization from TFNs.
+            The Fuzzy BWM block follows:
+            initial expert vectors → common best/worst → transformation →
+            aggregated converted vectors → direct optimization from TFNs.
+            No defuzzification is used before solving the BWM model.
             <br><br>
-            For the Fuzzy LBWA block:
-            λ TFN aggregation → Fuzzy influence using θ/(Qi·θ+λ) →
-            Reference weight → Fuzzy weights → Weighted defuzzification → Normalization.
+            The Fuzzy LBWA block now follows the same single editable-table input style as the standalone FLBWA app:
+            Factor + Qi + expert columns in one table, then Excel-aligned LBWA computation.
             </div>
         </div>
         """,
@@ -1225,52 +1240,56 @@ elif module == "3) Fuzzy LBWA + Hybrid":
 
     n_exp_lbwa = st.number_input("Number of experts", min_value=1, value=4, step=1)
     theta = st.number_input("Theta (θ)", min_value=0.0001, value=2.1, step=0.1, format="%.4f")
+    use_sample_lbwa = st.toggle("Use sample LBWA table", value=False)
 
-    st.markdown("**Step A: Reference factor selection**")
-    reference_idx_lbwa = st.selectbox(
-        "Reference / Main factor for LBWA",
-        options=range(len(factors)),
-        index=min(reference_idx_default, len(factors) - 1),
-        format_func=lambda x: factors[x],
+    st.markdown("**Step A: Enter Factor Information**")
+    st.caption("Edit one table directly for factor names, Qi values, and expert scores, following the FLBWA app style.")
+
+    lbwa_sig = ("|".join(factors), n_exp_lbwa, use_sample_lbwa)
+    if st.button("Prepare / Refresh LBWA Table", key="prep_lbwa") or st.session_state.get("lbwa_sig") != lbwa_sig:
+        st.session_state["lbwa_sig"] = lbwa_sig
+        st.session_state["lbwa_editor_df"] = init_lbwa_editor_df(factors, n_exp_lbwa, use_sample_lbwa, seed=200)
+
+    base_df = st.session_state["lbwa_editor_df"].copy()
+
+    # keep table shape aligned with current factor/expert counts
+    if list(base_df["Factor"]) != factors or len([c for c in base_df.columns if c.startswith("E")]) != n_exp_lbwa:
+        base_df = init_lbwa_editor_df(factors, n_exp_lbwa, use_sample_lbwa, seed=200)
+        st.session_state["lbwa_editor_df"] = base_df
+
+    edited_lbwa_df = st.data_editor(
+        base_df,
+        key="lbwa_editor",
+        use_container_width=True,
+        num_rows="fixed",
+        hide_index=True,
+        column_config={
+            "Factor": st.column_config.TextColumn("Factor", required=True),
+            "Qi": st.column_config.NumberColumn("Qi", min_value=0.0, step=1.0, format="%.2f"),
+            **{
+                f"E{i+1}": st.column_config.NumberColumn(
+                    f"E{i+1}", min_value=0.0, step=0.1, format="%.4f"
+                )
+                for i in range(n_exp_lbwa)
+            }
+        }
     )
 
-    use_sample_lbwa = st.toggle("Use sample LBWA tables", value=False)
+    st.markdown("**Step B: Select Reference / Main factor**")
+    factor_options = list(range(len(edited_lbwa_df)))
+
+    def factor_label_func(idx):
+        val = str(edited_lbwa_df.iloc[idx]["Factor"]).strip()
+        return f"{idx+1}. {val if val else f'Factor {idx+1}'}"
+
+    reference_idx_lbwa = st.selectbox(
+        "Reference / Main factor for LBWA",
+        options=factor_options,
+        index=min(reference_idx_default, len(factor_options) - 1),
+        format_func=factor_label_func,
+    )
+
     render_scale_table(HYBRID_SCALE, HYBRID_MEANING, "Show hybrid priority code legend")
-
-    lbwa_sig = ("|".join(factors), n_exp_lbwa, reference_idx_lbwa, theta, use_sample_lbwa)
-    if st.button("Prepare / Refresh LBWA Tables", key="prep_lbwa") or st.session_state.get("lbwa_sig") != lbwa_sig:
-        st.session_state["lbwa_sig"] = lbwa_sig
-        for e in range(n_exp_lbwa):
-            st.session_state[f"lbwa_df_{e}"] = init_lbwa_df(factors, use_sample_lbwa, seed=200 + e)
-
-    st.markdown("**Step B: Expert LBWA inputs (Qi and λ)**")
-    lbwa_tabs = st.tabs([f"Ex{i+1}" for i in range(n_exp_lbwa)])
-    lbwa_tables = []
-
-    for e, tab in enumerate(lbwa_tabs):
-        with tab:
-            base_df = st.session_state[f"lbwa_df_{e}"].copy()
-
-            if list(base_df["Factor"]) != factors:
-                base_df = init_lbwa_df(factors, use_sample=False, seed=200 + e)
-
-            base_df["Factor"] = factors
-
-            edited_df = st.data_editor(
-                base_df,
-                key=f"lbwa_editor_{e}",
-                use_container_width=True,
-                num_rows="fixed",
-                hide_index=True,
-                column_config={
-                    "Factor": st.column_config.TextColumn("Factor", disabled=True),
-                    "Qi": st.column_config.NumberColumn("Qi", min_value=0.0, step=1.0, format="%.2f"),
-                    "λ": st.column_config.NumberColumn("λ", min_value=0.0, step=0.1, format="%.6f"),
-                },
-            )
-
-            lbwa_tables.append(edited_df)
-            st.caption(f"Expert = E{e+1} | Reference factor = {factors[reference_idx_lbwa]}")
 
     c1, c2 = st.columns(2)
     with c1:
@@ -1283,43 +1302,32 @@ elif module == "3) Fuzzy LBWA + Hybrid":
 
     if st.button("Compute LBWA and Hybrid Weights", type="primary"):
         try:
-            for e, df in enumerate(lbwa_tables):
-                if df["Qi"].isna().any():
-                    st.error(f"Expert E{e+1}: Qi contains invalid or empty values.")
-                    st.stop()
-                if df["λ"].isna().any():
-                    st.error(f"Expert E{e+1}: λ contains invalid or empty values.")
-                    st.stop()
-                if (df["Qi"].astype(float) < 0).any():
-                    st.error(f"Expert E{e+1}: Qi must be non-negative.")
-                    st.stop()
-                if (df["λ"].astype(float) < 0).any():
-                    st.error(f"Expert E{e+1}: λ must be non-negative.")
-                    st.stop()
-
-            lbwa_output = run_lbwa_excel_style(
-                factors=factors,
-                reference_idx=reference_idx_lbwa,
-                expert_tables=lbwa_tables,
+            lbwa_output = run_lbwa_excel_single_table(
+                input_df=edited_lbwa_df,
+                num_experts=n_exp_lbwa,
                 theta=float(theta),
+                reference_idx=reference_idx_lbwa,
             )
 
             lbwa_weights = lbwa_output["weights"]
             result_df = lbwa_output["result_df"]
             top_factor = lbwa_output["top_factor"]
             top_weight = lbwa_output["top_weight"]
+            crisp_sum = lbwa_output["crisp_sum"]
 
             st.subheader("Fuzzy LBWA Weights")
 
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.metric("Reference Factor", lbwa_output["input_df"].iloc[reference_idx_lbwa]["Factor"])
+            with c2:
+                st.metric("Sum of Crisp Values", f"{crisp_sum:.10f}")
+            with c3:
+                st.metric("Sum of Final Weights", f"{result_df['Normalized Weight'].sum():.10f}")
+
             st.markdown(
-                f"""
-                <div class="app-card" style="background:linear-gradient(135deg,#ecfdf5 0%,#d1fae5 100%); border:1px solid #86efac;">
-                    <div class="card-title">🏆 Highest-ranked factor</div>
-                    <div class="small-note" style="color:#14532d; font-size:1rem;">
-                        <b>{top_factor}</b> &nbsp;|&nbsp; Final normalized weight = <b>{top_weight:.6f}</b>
-                    </div>
-                </div>
-                """,
+                f'<div class="top-factor">🏆 Highest-ranked factor: {top_factor} '
+                f'&nbsp;&nbsp;|&nbsp;&nbsp; Weight = {top_weight:.6f}</div>',
                 unsafe_allow_html=True
             )
 
@@ -1354,10 +1362,10 @@ elif module == "3) Fuzzy LBWA + Hybrid":
             st.bar_chart(result_df.set_index("Factor")[["Normalized Weight"]])
 
             st.session_state["lbwa_weights"] = lbwa_weights
-            st.session_state["lbwa_factors"] = factors
+            st.session_state["lbwa_factors"] = lbwa_output["input_df"]["Factor"].tolist()
             st.session_state["lbwa_result_df"] = result_df
 
-            if "bwm_weights" in st.session_state and len(st.session_state["bwm_weights"]) == len(factors):
+            if "bwm_weights" in st.session_state and len(st.session_state["bwm_weights"]) == len(lbwa_weights):
                 hybrid_weights = combine_weights(
                     st.session_state["bwm_weights"],
                     lbwa_weights,
@@ -1366,7 +1374,7 @@ elif module == "3) Fuzzy LBWA + Hybrid":
                 )
 
                 hybrid_df = pd.DataFrame({
-                    "Factor": factors,
+                    "Factor": lbwa_output["input_df"]["Factor"].tolist(),
                     "Hybrid TFN": [tfn_to_str(w, 6) for w in hybrid_weights],
                     "Hybrid GMI": [round(gmi(w), 6) for w in hybrid_weights],
                 }).sort_values("Hybrid GMI", ascending=False)
@@ -1384,7 +1392,7 @@ elif module == "3) Fuzzy LBWA + Hybrid":
             st.error(f"An error occurred while computing LBWA: {e}")
 
 # ============================================================
-# MODULE 4: FUZZY BONFERRONI COCOSO
+# MODULE 4: FUZZY BONFERRONI COCO-SO
 # ============================================================
 elif module == "4) Fuzzy Bonferroni CoCoSo":
     st.markdown('<div class="section-head">Fuzzy Bonferroni CoCoSo – Technology Ranking</div>', unsafe_allow_html=True)
